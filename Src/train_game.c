@@ -15,7 +15,13 @@
  *   Deadman  : 7-segment counts 9 -> 0; moving the throttle or a new button
  *              press restarts it; reaching 0 = driver asleep -> alarm
  *   Emergency: button 2 while driving -> alarm, 'r' -> continue from same spot
- * Date         : 2026-10-08
+ *   No polling: buttons = EXTI + TIM3 debounce interrupts, serial = USART2
+ *              interrupts, analog = ADC1 + DMA2, the CPU sleeps (WFI) while
+ *              waiting and is woken by SysTick / UART / EXTI / TIM interrupts
+ *              RFID = RC522 IRQ pin on EXTI8
+ *   Peripherals: GPIO, USART2 (IRQ), ADC1 + DMA2, EXTI lines 3/4/5/8/10,
+ *                TIM2 (buzzer IRQ), TIM3 (debounce IRQ), SysTick 1 ms
+ * Date         : 2026-10-09
  ******************************************************************************/
 
 /* Includes ------------------------------------------------------------------*/
@@ -36,9 +42,9 @@
 
 /* Private enum --------------------------------------------------------------*/
 typedef enum {
-    POLL_TIMEOUT = 0,            /* 1 second passed                     */
-    POLL_EMERGENCY               /* emergency button pressed            */
-} poll_result_t;
+    WAIT_TIMEOUT = 0,            /* 1 second passed                     */
+    WAIT_EMERGENCY               /* emergency button pressed            */
+} wait_result_t;
 
 typedef enum {
     LEG_STATION = 0,             /* ask "stop?" near the target         */
@@ -53,9 +59,9 @@ typedef enum {
 } door_state_t;
 
 /* Private struct ------------------------------------------------------------*/
-/* Button events during one poll period (only new presses are counted) */
+/* Button events during one drive tick (presses counted by the interrupts) */
 typedef struct {
-    bool     b_stop_held;        /* STOP was down at some time          */
+    bool     b_stop_held;        /* STOP is held down at the end        */
     uint32_t u4_stop_presses;
     uint32_t u4_track_presses;
     uint32_t u4_dead_presses;
@@ -115,11 +121,12 @@ typedef struct {
 #define TWO_DIGIT_LIMIT         (10U)
 
 /* Timing (ms) */
-#define POLL_PERIOD_MS          (1000U)
-#define BUTTON_SAMPLE_MS        (10U)
+#define DRIVE_TICK_MS           (1000U)  /* one driving step                     */
+#define LED_REFRESH_MS          (10U)    /* minigame LED / timer update period   */
 #define BLINK_HALF_PERIOD_MS    (250U)
 #define ALARM_GAP_MS            (250U)
 #define RFID_CHECK_MS           (2000U)
+#define RFID_SCAN_MS            (50U)    /* time between two card requests       */
 #define START_BLINK_TIMES       (5U)
 #define START_BLINK_HALF_MS     (100U)
 
@@ -170,14 +177,10 @@ static bool     bg_trip_on = false;        /* true = trip clock is running    */
 static bool     bg_zone_entered = false;   /* entered the community zone      */
 static uint32_t u4g_zone_violation = 0U;   /* speed camera hits               */
 static int32_t  s4g_zone_max_kmh = 0;      /* highest speed caught by camera  */
-static bool     bg_prev_stop = false;      /* button states of the last sample */
-static bool     bg_prev_track = false;
-static bool     bg_prev_dead = false;
 
 /* External variables --------------------------------------------------------*/
 
 /* Private function prototypes -----------------------------------------------*/
-static bool          rising_edge(bool bt_now, bool *pt_prev);
 static bool          key_received(char ct_lower, char ct_upper);
 static void          wait_for_key(char ct_lower, char ct_upper, bool bt_update_headlight);
 static uint32_t      trip_clock_s(void);
@@ -185,7 +188,7 @@ static void          send_2digits(uint32_t u4t_value);
 static void          send_clock(uint32_t u4t_clock_s);
 static void          send_time_tag(void);
 static void          send_headlight(void);
-static poll_result_t poll_buttons_1s(btn_event_t *pt_event);
+static wait_result_t wait_drive_tick(btn_event_t *pt_event);
 static void          gauge_show(uint32_t u4t_level);
 static void          run_alarm(const char *pt_message);
 static void          resume_driving(bool bt_asking);
@@ -316,28 +319,6 @@ void TrainGame_RunJourney(void)
 /* Callback functions --------------------------------------------------------*/
 /* Private functions ---------------------------------------------------------*/
 /*********************************************************************
- * @fn                - rising_edge
- * @brief             - Detect a new press (released -> pressed)
- *
- * @param[in]         - bt_now : current button state
- * @param[in,out]     - pt_prev : state of the last sample (updated)
- *
- * @return            - true = new press
- *********************************************************************/
-static bool rising_edge(bool bt_now, bool *pt_prev)
-{
-    bool bt_edge = false;
-
-    if ((bt_now == true) && (*pt_prev == false)) {
-        bt_edge = true;
-    } else {
-        /* No action */
-    }
-    *pt_prev = bt_now;
-    return bt_edge;
-}
-
-/*********************************************************************
  * @fn                - key_received
  * @brief             - Non-blocking check for a key on the serial port
  *
@@ -364,7 +345,8 @@ static bool key_received(char ct_lower, char ct_upper)
 
 /*********************************************************************
  * @fn                - wait_for_key
- * @brief             - Block until the key is typed on the serial port
+ * @brief             - Wait (CPU asleep) until the key is typed on the
+ *                      serial port
  *
  * @param[in]         - ct_lower / ct_upper : accepted characters
  * @param[in]         - bt_update_headlight : true = keep the headlight working
@@ -380,6 +362,11 @@ static void wait_for_key(char ct_lower, char ct_upper, bool bt_update_headlight)
             /* LEDs are kept as they are */
         }
         bt_done = key_received(ct_lower, ct_upper);
+        if (bt_done == false) {
+            Timebase_Sleep();           /* woken by the UART RX interrupt or SysTick */
+        } else {
+            /* No action */
+        }
     }
 }
 
@@ -451,56 +438,40 @@ static void send_headlight(void)
 }
 
 /*********************************************************************
- * @fn                - poll_buttons_1s
- * @brief             - Keep the headlight working and sample the buttons
- *                      for 1 second
+ * @fn                - wait_drive_tick
+ * @brief             - One driving step of DRIVE_TICK_MS: keep the headlight
+ *                      working and let the CPU sleep, then collect the
+ *                      button presses counted by the interrupts
  *
- * @param[out]        - pt_event : button events (only new presses counted)
+ * @param[out]        - pt_event : button events of this step
  *
- * @return            - POLL_EMERGENCY at once if the emergency button is
- *                      pressed, otherwise POLL_TIMEOUT after 1 second
+ * @return            - WAIT_EMERGENCY at once if the emergency button was
+ *                      pressed (EXTI3), otherwise WAIT_TIMEOUT
  *
- * @Note              - Holding a button does not block the game
+ * @Note              - No button is polled: EXTI + TIM3 count the presses
  *********************************************************************/
-static poll_result_t poll_buttons_1s(btn_event_t *pt_event)
+static wait_result_t wait_drive_tick(btn_event_t *pt_event)
 {
-    poll_result_t et_result = POLL_TIMEOUT;
+    wait_result_t et_result = WAIT_TIMEOUT;
     uint32_t      u4t_start = Timebase_GetMs();
     bool          bt_done = false;
-    bool          bt_stop;
 
     while (bt_done == false) {
         Headlight_Update();
-        if (Button_IsPressed(BTN_EMERGENCY) == true) {
-            et_result = POLL_EMERGENCY;
+        if (Button_TakePresses(BTN_EMERGENCY) > 0U) {
+            et_result = WAIT_EMERGENCY;
             bt_done = true;
-        } else if ((Timebase_GetMs() - u4t_start) >= POLL_PERIOD_MS) {
+        } else if ((Timebase_GetMs() - u4t_start) >= DRIVE_TICK_MS) {
             bt_done = true;
         } else {
-            bt_stop = Button_IsPressed(BTN_STOP);
-            if (bt_stop == true) {
-                pt_event->b_stop_held = true;
-            } else {
-                /* No action */
-            }
-            if (rising_edge(bt_stop, &bg_prev_stop) == true) {
-                pt_event->u4_stop_presses++;
-            } else {
-                /* No action */
-            }
-            if (rising_edge(Button_IsPressed(BTN_TRACK), &bg_prev_track) == true) {
-                pt_event->u4_track_presses++;
-            } else {
-                /* No action */
-            }
-            if (rising_edge(Button_IsPressed(BTN_DEADMAN), &bg_prev_dead) == true) {
-                pt_event->u4_dead_presses++;
-            } else {
-                /* No action */
-            }
-            Timebase_DelayMs(BUTTON_SAMPLE_MS);
+            Timebase_Sleep();           /* woken by SysTick (1 ms) or a button IRQ */
         }
     }
+
+    pt_event->u4_stop_presses = Button_TakePresses(BTN_STOP);
+    pt_event->u4_track_presses = Button_TakePresses(BTN_TRACK);
+    pt_event->u4_dead_presses = Button_TakePresses(BTN_DEADMAN);
+    pt_event->b_stop_held = Button_IsPressed(BTN_STOP);
     return et_result;
 }
 
@@ -543,6 +514,7 @@ static void run_alarm(const char *pt_message)
         bt_reset = key_received(KEY_RESET_LOWER, KEY_RESET_UPPER);
     }
     LED_Set(LED_RED, false);
+    Button_ClearPresses();              /* ignore presses made during the alarm */
 }
 
 /*********************************************************************
@@ -630,6 +602,7 @@ static uint32_t drive_leg(const char *pt_name, leg_type_t et_type, int32_t s4t_z
     uint16_t    u2t_last_pot = ADC_Read(THROTTLE_ADC_CH);
     btn_event_t st_event;
 
+    Button_ClearPresses();              /* presses from a minigame do not count */
     LED_Set(LED_GREEN, true);
     send_time_tag();
     UART_SendString("[DRIVE] มุ่งหน้า ");
@@ -649,7 +622,7 @@ static uint32_t drive_leg(const char *pt_name, leg_type_t et_type, int32_t s4t_z
         st_event.u4_dead_presses = 0U;
         Seg7_Show((uint8_t)s4t_count);
 
-        if (poll_buttons_1s(&st_event) == POLL_EMERGENCY) {
+        if (wait_drive_tick(&st_event) == WAIT_EMERGENCY) {
             /* emergency brake -> alarm -> continue from the same distance */
             run_alarm("EMERGENCY");
             resume_driving(bt_asking);
@@ -872,7 +845,6 @@ static void wait_depart(void)
 static void passenger_minigame(void)
 {
     door_state_t et_door[CAR_COUNT];
-    bool         bt_prev[CAR_COUNT];
     uint32_t     u4t_open_ms[CAR_COUNT];
     uint32_t     u4t_done = 0U;
     uint32_t     u4t_now;
@@ -881,9 +853,9 @@ static void passenger_minigame(void)
 
     for (u4t_i = 0U; u4t_i < CAR_COUNT; u4t_i++) {
         et_door[u4t_i] = DOOR_CLOSED;
-        bt_prev[u4t_i] = Button_IsPressed(etg_car_button[u4t_i]);   /* ignore held buttons */
         u4t_open_ms[u4t_i] = 0U;
     }
+    Button_ClearPresses();              /* only presses from now on */
     Buzzer_Beep(BEEP_ARRIVE);
     LED_SetAll(false);
     Seg7_Show(SEG7_ZERO);
@@ -896,7 +868,7 @@ static void passenger_minigame(void)
         bt_blink_on = (((u4t_now / BLINK_HALF_PERIOD_MS) % TOGGLE_DIVISOR) != 0U);
 
         for (u4t_i = 0U; u4t_i < CAR_COUNT; u4t_i++) {
-            if (rising_edge(Button_IsPressed(etg_car_button[u4t_i]), &bt_prev[u4t_i]) == true) {
+            if (Button_TakePresses(etg_car_button[u4t_i]) > 0U) {
                 switch (et_door[u4t_i]) {
                     case DOOR_CLOSED:
                         et_door[u4t_i] = DOOR_LOADING;
@@ -947,7 +919,7 @@ static void passenger_minigame(void)
                 LED_Set(etg_car_led[u4t_i], false);
             }
         }
-        Timebase_DelayMs(BUTTON_SAMPLE_MS);
+        Timebase_DelayMs(LED_REFRESH_MS);   /* CPU sleeps, presses are counted by IRQ */
     }
 
     LED_SetAll(false);
@@ -966,7 +938,7 @@ static void charge_minigame(void)
     uint32_t u4t_count = 0U;
     uint32_t u4t_level;
     uint32_t u4t_last_level = 0U;
-    bool     bt_prev = Button_IsPressed(BTN_TRACK);
+    uint32_t u4t_new;
 
     Buzzer_Beep(BEEP_ARRIVE);
     LED_SetAll(false);
@@ -976,8 +948,11 @@ static void charge_minigame(void)
     UART_SendUint(CHARGE_PRESSES);
     UART_SendString(" ครั้ง\r\n");
 
+    Button_ClearPresses();              /* only presses from now on */
     while (u4t_count < CHARGE_PRESSES) {
-        if (rising_edge(Button_IsPressed(BTN_TRACK), &bt_prev) == true) {
+        u4t_new = Button_TakePresses(BTN_TRACK);
+        while ((u4t_new > 0U) && (u4t_count < CHARGE_PRESSES)) {
+            u4t_new--;
             u4t_count++;
             u4t_level = ((u4t_count * GAUGE_LEVELS) + (CHARGE_PRESSES - 1U)) / CHARGE_PRESSES;
             gauge_show(u4t_level);
@@ -995,10 +970,8 @@ static void charge_minigame(void)
             } else {
                 /* No action */
             }
-        } else {
-            /* No action */
         }
-        Timebase_DelayMs(BUTTON_SAMPLE_MS);
+        Timebase_DelayMs(LED_REFRESH_MS);   /* CPU sleeps, presses are counted by IRQ */
     }
 
     Buzzer_Beep(BEEP_DONE);
@@ -1034,6 +1007,7 @@ static void wait_for_card(uint8_t *pt_uid)
     bool     bt_got_card = false;
     bool     bt_alive;
     bool     bt_alive_now;
+    bool     bt_irq_warned = false;
     uint32_t u4t_check_ms;
 
     UART_SendString("[START] แตะบัตร RFID เพื่อเริ่ม...\r\n");
@@ -1041,13 +1015,20 @@ static void wait_for_card(uint8_t *pt_uid)
     bt_alive = RC522_IsAlive();
     u4t_check_ms = Timebase_GetMs();
     if (bt_alive == false) {
-        UART_SendString("[RFID] โมดูล RC522 ไม่ตอบ -> เช็กสาย SDA=A0 SCK=A3 MOSI=A4 MISO=A5, 3.3V, GND, RST\r\n");
+        UART_SendString("[RFID] โมดูล RC522 ไม่ตอบ -> เช็กสาย SDA=A0 SCK=A3 MOSI=A4 MISO=A5 IRQ=D15, 3.3V, GND, RST\r\n");
     } else {
         /* No action */
     }
 
     while (bt_got_card == false) {
+        Timebase_DelayMs(RFID_SCAN_MS);
         bt_got_card = RC522_ReadUid(pt_uid);
+        if ((RC522_IsIrqPinOk() == false) && (bt_irq_warned == false)) {
+            UART_SendString("[RFID] ไม่ได้รับ interrupt จากขา IRQ -> ต่อขา IRQ ของ RC522 เข้าที่ D15 (PB8)\r\n");
+            bt_irq_warned = true;
+        } else {
+            /* No action */
+        }
         if ((bt_got_card == false) && ((Timebase_GetMs() - u4t_check_ms) >= RFID_CHECK_MS)) {
             u4t_check_ms = Timebase_GetMs();
             bt_alive_now = RC522_IsAlive();

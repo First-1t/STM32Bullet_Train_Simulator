@@ -89,7 +89,7 @@
 #define ADC_CH_POT_EXT          (12U)
 
 /* RC522 RFID (bit-bang SPI) : SDA/CS = A0, SCK = A3, MOSI = A4, MISO = A5,
-   RST -> 3V3 , 3.3V -> 3V3 , GND -> GND */
+   IRQ = D15 (PB8, EXTI8), RST -> 3V3 , 3.3V -> 3V3 , GND -> GND */
 #define RC522_CS_PORT           (GPIOA)
 #define RC522_CS_PIN            (0U)
 #define RC522_SCK_PORT          (GPIOB)
@@ -98,6 +98,8 @@
 #define RC522_MOSI_PIN          (1U)
 #define RC522_MISO_PORT         (GPIOC)
 #define RC522_MISO_PIN          (0U)
+#define RC522_IRQ_PORT          (GPIOB)
+#define RC522_IRQ_PIN           (8U)
 
 /* Exported macro ------------------------------------------------------------*/
 

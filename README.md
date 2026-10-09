@@ -2,6 +2,9 @@
 
 เกมจำลองการขับรถไฟความเร็วสูงบน **NUCLEO-F411RE + NEXTY Training Shield 1**
 เขียนแบบ register-level ด้วย CMSIS ล้วน (ไม่ใช้ HAL) ควบคุมผ่าน serial terminal (115200 8N1)
+ทำงานด้วย interrupt / DMA ทั้งหมด **ไม่มี polling**
+
+📖 **ไม่ถนัดภาษา C? เริ่มอ่านที่ [CODE_GUIDE.md](CODE_GUIDE.md)** — คู่มืออ่านโค้ดทีละขั้น
 
 ## ภาพรวมเกม
 1. **START** แตะบัตร RFID → ไฟ 4 ดวงกระพริบ → แจ้งภารกิจ → พิมพ์ `g` ออกรถ (นาฬิกาเริ่ม 12:00:00)
@@ -17,11 +20,23 @@
 - **Emergency** (ปุ่ม 2) ไฟแดง + buzzer พิมพ์ `r` แล้วขับต่อจากจุดเดิม
 - ไฟหน้า (LED เหลือง) เปิด/ปิดอัตโนมัติตามเซนเซอร์แสง
 
+## Peripheral และ Interrupt
+| ข้อกำหนด | ใช้ในโปรเจกต์ |
+|---|---|
+| GPIO | ปุ่ม 4, LED 4, 7-segment, buzzer, ขา RC522 |
+| UART (interrupt) | USART2 interrupt RXNE + TXE พร้อม ring buffer |
+| ADC (DMA) | ADC1 สแกน 3 ช่องต่อเนื่อง + DMA2 Stream0 แบบ circular |
+| EXTI | ปุ่ม 4 ปุ่ม (line 3, 4, 5, 10) + ขา IRQ ของ RC522 (line 8) |
+| Timer | TIM2 = เสียง buzzer, TIM3 = กันปุ่มเด้ง 20 ms, SysTick = เวลา 1 ms |
+
+ระหว่างรอ CPU จะหลับด้วย `__WFI()` แล้วให้ interrupt มาปลุก
+
 ## โครงสร้างไฟล์
 | โมดูล | หน้าที่ |
 |---|---|
 | `board` | header ของชิป, pin map ทั้งหมด, ฟังก์ชัน GPIO, `SystemInit` |
-| `timebase` | SysTick interrupt 1 ms, delay |
+| `timebase` | SysTick interrupt 1 ms, sleep / delay |
+| `exti` | ตั้งค่า EXTI และ ISR ของ EXTI ทุกตัว (ส่งต่อให้ button / rc522) |
 | `uart` / `adc` / `led` / `button` / `seg7` / `buzzer` / `rc522` | ไดรเวอร์ฮาร์ดแวร์ |
 | `headlight` | ไฟหน้าอัตโนมัติ |
 | `train_game` | ตรรกะเกม (state machine, มินิเกม, สรุปผล) |
@@ -40,6 +55,7 @@
 | โพเทนฯคันเร่งภายนอก (ขากลาง) | PC2 |
 | Buzzer (+) | PC3 |
 | RC522: SDA / SCK / MOSI / MISO | A0 / A3 / A4 / A5 (RST และ 3.3V → 3V3) |
+| RC522: IRQ | D15 (PB8) |
 | UART (ST-LINK virtual COM) | PA2 / PA3 |
 
 ⚠️ RC522 และโพเทนฯใช้ไฟ **3.3V เท่านั้น**

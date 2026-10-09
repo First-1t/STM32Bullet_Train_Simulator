@@ -2,7 +2,11 @@
  * File Name    : rc522.c
  * Description  : MFRC522 (RC522) RFID reader driver over bit-bang SPI mode 0.
  *                Reads the 4-byte UID of an ISO14443A card (WUPA + anticollision).
- * Date         : 2026-10-08
+ *                Interrupt driven: the RC522 IRQ pin (PB8, EXTI8, falling edge)
+ *                tells the MCU that the card answered (RxIRq) or that the
+ *                RC522 timer ran out (TimerIRq = no card). While waiting the
+ *                CPU sleeps, the status register is never polled.
+ * Date         : 2026-10-09
  ******************************************************************************/
 
 /* Includes ------------------------------------------------------------------*/
@@ -10,6 +14,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 #include "timebase.h"
+#include "exti.h"
 
 /* Private typedef -----------------------------------------------------------*/
 
@@ -60,7 +65,7 @@
 #define TX_ANTENNA_ON           (0x03U)
 
 /* Bits used by transceive */
-#define IRQ_ENABLE_ALL_INV      (0xF7U)  /* all IRQ sources + IRqInv */
+#define IRQ_ENABLE_RX_IDLE_TIMER (0xB1U) /* IRqInv (pin low = IRQ) + RxIEn + IdleIEn + TimerIEn */
 #define COM_IRQ_SET1            (0x80U)
 #define FIFO_FLUSH              (0x80U)
 #define BIT_FRAMING_START_SEND  (0x80U)
@@ -71,7 +76,7 @@
 #define ERROR_MASK              (0x1BU)  /* BufferOvfl, ColErr, ParityErr, ProtocolErr */
 #define RX_LAST_BITS_MASK       (0x07U)
 #define FIFO_MAX_BYTES          (16U)
-#define TRANSCEIVE_WAIT_LOOPS   (20000U)
+#define TRANSCEIVE_TIMEOUT_MS   (30U)    /* RC522 timer gives up after 15 ms  */
 #define ATQA_BITS               (16U)
 
 /* SPI address byte */
@@ -83,7 +88,6 @@
 #define BITS_PER_BYTE           (8U)
 #define SPI_MSB_MASK            (0x80U)
 #define SPI_LSB_MASK            (0x01U)
-#define SPI_DELAY_LOOPS         (8U)
 #define RESET_DELAY_MS          (50U)
 
 /* VersionReg values that mean "no module answering" */
@@ -95,11 +99,12 @@
 /* Private constants ---------------------------------------------------------*/
 
 /* Private variables ---------------------------------------------------------*/
+static volatile bool bg_irq_flag = false;   /* set by RC522_ExtiCallback            */
+static bool          bg_irq_pin_ok = true;  /* false = RC522 IRQ seen, no EXTI edge */
 
 /* External variables --------------------------------------------------------*/
 
 /* Private function prototypes -----------------------------------------------*/
-static void    spi_delay(void);
 static uint8_t spi_transfer(uint8_t u1t_out);
 static void    reg_write(uint8_t u1t_reg, uint8_t u1t_value);
 static uint8_t reg_read(uint8_t u1t_reg);
@@ -122,6 +127,9 @@ static bool    transceive(const uint8_t *pt_send, uint32_t u4t_send_len,
  *
  * @Note              - RST of the module is tied to 3V3; reset is done by
  *                      the SoftReset command. Can be called again at any time.
+ *                      Also sets up the IRQ pin (PB8) on EXTI8, falling edge.
+ *                      RC522 IRQ stays open-drain (reset value): the MCU
+ *                      pull-up makes the high level, D15 is shared with I2C.
  *********************************************************************/
 void RC522_Init(void)
 {
@@ -130,6 +138,9 @@ void RC522_Init(void)
     GPIO_SetMode(RC522_MOSI_PORT, RC522_MOSI_PIN, GPIO_MODE_OUTPUT);
     GPIO_SetMode(RC522_MISO_PORT, RC522_MISO_PIN, GPIO_MODE_INPUT);
     GPIO_SetPullUp(RC522_MISO_PORT, RC522_MISO_PIN);
+    GPIO_SetMode(RC522_IRQ_PORT, RC522_IRQ_PIN, GPIO_MODE_INPUT);
+    GPIO_SetPullUp(RC522_IRQ_PORT, RC522_IRQ_PIN);
+    Exti_ConfigLine(RC522_IRQ_PORT, RC522_IRQ_PIN, EXTI_TRIGGER_FALLING);
 
     GPIO_WritePin(RC522_CS_PORT, RC522_CS_PIN, true);
     GPIO_WritePin(RC522_SCK_PORT, RC522_SCK_PIN, false);
@@ -225,25 +236,45 @@ bool RC522_ReadUid(uint8_t *pt_uid)
     return bt_ok;
 }
 
-/* Callback functions --------------------------------------------------------*/
-/* Private functions ---------------------------------------------------------*/
 /*********************************************************************
- * @fn                - spi_delay
- * @brief             - Short busy wait to stretch the SPI clock
+ * @fn                - RC522_IsIrqPinOk
+ * @brief             - Check the wiring of the RC522 IRQ pin
+ *
+ * @param[in]         - none
+ *
+ * @return            - false = the RC522 raised an interrupt but no EXTI
+ *                      edge came (IRQ wire to D15 missing), true = OK
  *********************************************************************/
-static void spi_delay(void)
+bool RC522_IsIrqPinOk(void)
 {
-    volatile uint32_t u4t_loop;
+    return bg_irq_pin_ok;
+}
 
-    for (u4t_loop = 0U; u4t_loop < SPI_DELAY_LOOPS; u4t_loop++) {
-        /* wait */
+/* Callback functions --------------------------------------------------------*/
+/*********************************************************************
+ * @fn                - RC522_ExtiCallback
+ * @brief             - Called by EXTI9_5_IRQHandler (exti.c): the RC522
+ *                      IRQ pin went low (card answered or RC522 timeout)
+ *
+ * @param[in]         - none
+ *
+ * @return            - none
+ *********************************************************************/
+void RC522_ExtiCallback(void)
+{
+    if (Exti_TakePending(RC522_IRQ_PIN) == true) {
+        bg_irq_flag = true;
+    } else {
+        /* No action */
     }
 }
+
+/* Private functions ---------------------------------------------------------*/
 
 /*********************************************************************
  * @fn                - spi_transfer
  * @brief             - Exchange one byte, SPI mode 0 (CPOL = 0, CPHA = 0),
- *                      MSB first
+ *                      MSB first (clock about 500 kHz, set by the code speed)
  *
  * @param[in]         - u1t_out : byte to send on MOSI
  *
@@ -259,7 +290,6 @@ static uint8_t spi_transfer(uint8_t u1t_out)
         GPIO_WritePin(RC522_MOSI_PORT, RC522_MOSI_PIN, ((u1t_data & SPI_MSB_MASK) != 0U));
         u1t_data = (uint8_t)(u1t_data << 1U);
         GPIO_WritePin(RC522_SCK_PORT, RC522_SCK_PIN, true);
-        spi_delay();
         u1t_in = (uint8_t)(u1t_in << 1U);
         if (GPIO_ReadPin(RC522_MISO_PORT, RC522_MISO_PIN) == true) {
             u1t_in = (uint8_t)(u1t_in | SPI_LSB_MASK);
@@ -267,7 +297,6 @@ static uint8_t spi_transfer(uint8_t u1t_out)
             /* bit = 0 */
         }
         GPIO_WritePin(RC522_SCK_PORT, RC522_SCK_PIN, false);
-        spi_delay();
     }
     return u1t_in;
 }
@@ -327,20 +356,26 @@ static void reg_clear_bits(uint8_t u1t_reg, uint8_t u1t_mask)
  * @param[out]        - pt_back_bits : number of valid bits in the answer
  *
  * @return            - true = answer received without error
+ *
+ * @Note              - Waits with the CPU asleep until the RC522 IRQ pin
+ *                      (EXTI8) fires; TRANSCEIVE_TIMEOUT_MS is only a
+ *                      safety limit if the IRQ wire is missing
  *********************************************************************/
 static bool transceive(const uint8_t *pt_send, uint32_t u4t_send_len,
                        uint8_t *pt_back, uint32_t *pt_back_bits)
 {
-    uint32_t u4t_wait = TRANSCEIVE_WAIT_LOOPS;
-    bool     bt_waiting = true;
+    uint32_t u4t_start;
+    bool     bt_done;
     bool     bt_ok = false;
     uint8_t  u1t_irq;
     uint32_t u4t_level;
     uint32_t u4t_last_bits;
     uint32_t u4t_i;
 
-    reg_write(REG_COM_IEN, IRQ_ENABLE_ALL_INV);
-    reg_clear_bits(REG_COM_IRQ, COM_IRQ_SET1);
+    reg_write(REG_COM_IEN, IRQ_ENABLE_RX_IDLE_TIMER);
+    reg_clear_bits(REG_COM_IRQ, COM_IRQ_SET1);      /* IRQ pin back to high */
+    Exti_ClearPending(RC522_IRQ_PIN);
+    bg_irq_flag = false;
     reg_set_bits(REG_FIFO_LEVEL, FIFO_FLUSH);
     reg_write(REG_COMMAND, CMD_IDLE);
 
@@ -350,19 +385,25 @@ static bool transceive(const uint8_t *pt_send, uint32_t u4t_send_len,
     reg_write(REG_COMMAND, CMD_TRANSCEIVE);
     reg_set_bits(REG_BIT_FRAMING, BIT_FRAMING_START_SEND);
 
-    /* wait for RX / idle, or the internal timer (= no card), or give up */
-    while (bt_waiting == true) {
-        u1t_irq = reg_read(REG_COM_IRQ);
-        u4t_wait--;
-        if ((u4t_wait == 0U) || ((u1t_irq & IRQ_TIMER) != 0U) || ((u1t_irq & IRQ_RX_OR_IDLE) != 0U)) {
-            bt_waiting = false;
-        } else {
-            /* keep waiting */
-        }
+    /* sleep until the IRQ pin interrupt: RX / idle, or RC522 timer (= no card) */
+    u4t_start = Timebase_GetMs();
+    while ((bg_irq_flag == false) && ((Timebase_GetMs() - u4t_start) < TRANSCEIVE_TIMEOUT_MS)) {
+        Timebase_Sleep();
     }
     reg_clear_bits(REG_BIT_FRAMING, BIT_FRAMING_START_SEND);
 
-    if ((u4t_wait != 0U) && ((reg_read(REG_ERROR) & ERROR_MASK) == 0U)) {
+    /* which event woke us (read once, after the interrupt) */
+    u1t_irq = reg_read(REG_COM_IRQ);
+    bt_done = (((u1t_irq & IRQ_TIMER) != 0U) || ((u1t_irq & IRQ_RX_OR_IDLE) != 0U));
+    if (bg_irq_flag == true) {
+        bg_irq_pin_ok = true;
+    } else if (bt_done == true) {
+        bg_irq_pin_ok = false;              /* RC522 raised IRQ but no EXTI edge */
+    } else {
+        /* module not answering at all */
+    }
+
+    if ((bt_done == true) && ((reg_read(REG_ERROR) & ERROR_MASK) == 0U)) {
         u4t_level = (uint32_t)reg_read(REG_FIFO_LEVEL);
         u4t_last_bits = (uint32_t)reg_read(REG_CONTROL) & RX_LAST_BITS_MASK;
         if ((u4t_last_bits != 0U) && (u4t_level > 0U)) {

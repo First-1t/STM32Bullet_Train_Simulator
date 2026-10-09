@@ -1,7 +1,7 @@
 /*******************************************************************************
  * File Name    : uart.h
- * Description  : Header file for uart.c (USART2, 115200 8N1, polling)
- * Date         : 2026-10-08
+ * Description  : Header file for uart.c (USART2, 115200 8N1, interrupt driven)
+ * Date         : 2026-10-09
  ******************************************************************************/
 #ifndef UART_H
 #define UART_H
@@ -35,5 +35,6 @@ void UART_SendUint(uint32_t u4t_value);
 void UART_SendHex8(uint8_t u1t_value);
 bool UART_ReadChar(char *pt_ch);
 void UART_FlushRx(void);
+void USART2_IRQHandler(void);
 
 #endif /* UART_H */

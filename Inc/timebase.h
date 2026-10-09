@@ -31,6 +31,7 @@
 /* Exported function prototypes ----------------------------------------------*/
 void     Timebase_Init(void);
 uint32_t Timebase_GetMs(void);
+void     Timebase_Sleep(void);
 void     Timebase_DelayMs(uint32_t u4t_ms);
 void     SysTick_Handler(void);
 

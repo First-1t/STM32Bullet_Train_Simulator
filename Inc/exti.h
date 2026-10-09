@@ -1,11 +1,11 @@
 /*******************************************************************************
- * File Name    : button.h
- * Description  : Header file for button.c (4 push buttons, active-low,
- *                EXTI on every button + TIM3 debounce, no polling)
+ * File Name    : exti.h
+ * Description  : Header file for exti.c (EXTI line setup + EXTI interrupt
+ *                handlers that forward each line to its driver)
  * Date         : 2026-10-09
  ******************************************************************************/
-#ifndef BUTTON_H
-#define BUTTON_H
+#ifndef EXTI_H
+#define EXTI_H
 
 /* Includes ------------------------------------------------------------------*/
 #include "board.h"
@@ -15,19 +15,15 @@
 /* Exported typedef ----------------------------------------------------------*/
 
 /* Exported enum -------------------------------------------------------------*/
-typedef enum {
-    BUTTON_1 = 0,                /* PA10 (D2) */
-    BUTTON_2,                    /* PB3  (D3) */
-    BUTTON_3,                    /* PB5  (D4) */
-    BUTTON_4,                    /* PB4  (D5) */
-    BUTTON_COUNT
-} button_id_t;
 
 /* Exported struct -----------------------------------------------------------*/
 
 /* Exported union ------------------------------------------------------------*/
 
 /* Exported define -----------------------------------------------------------*/
+#define EXTI_TRIGGER_RISING     (0x1U)
+#define EXTI_TRIGGER_FALLING    (0x2U)
+#define EXTI_TRIGGER_BOTH       (EXTI_TRIGGER_RISING | EXTI_TRIGGER_FALLING)
 
 /* Exported macro ------------------------------------------------------------*/
 
@@ -36,11 +32,14 @@ typedef enum {
 /* Exported variables --------------------------------------------------------*/
 
 /* Exported function prototypes ----------------------------------------------*/
-void     Button_Init(void);
-bool     Button_IsPressed(button_id_t et_button);
-uint32_t Button_TakePresses(button_id_t et_button);
-void     Button_ClearPresses(void);
-void     Button_ExtiCallback(void);
-void     TIM3_IRQHandler(void);
+void Exti_ConfigLine(const GPIO_TypeDef *pt_port, uint32_t u4t_pin, uint32_t u4t_trigger);
+bool Exti_TakePending(uint32_t u4t_line);
+void Exti_ClearPending(uint32_t u4t_line);
+void Exti_Mask(uint32_t u4t_line);
+void Exti_Unmask(uint32_t u4t_line);
+void EXTI3_IRQHandler(void);
+void EXTI4_IRQHandler(void);
+void EXTI9_5_IRQHandler(void);
+void EXTI15_10_IRQHandler(void);
 
-#endif /* BUTTON_H */
+#endif /* EXTI_H */

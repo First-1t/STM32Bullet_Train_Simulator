@@ -1,7 +1,8 @@
 /*******************************************************************************
  * File Name    : rc522.h
- * Description  : Header file for rc522.c (MFRC522 RFID reader, bit-bang SPI)
- * Date         : 2026-10-08
+ * Description  : Header file for rc522.c (MFRC522 RFID reader, bit-bang SPI,
+ *                IRQ pin on EXTI8)
+ * Date         : 2026-10-09
  ******************************************************************************/
 #ifndef RC522_H
 #define RC522_H
@@ -33,5 +34,7 @@ void    RC522_Init(void);
 uint8_t RC522_GetVersion(void);
 bool    RC522_IsAlive(void);
 bool    RC522_ReadUid(uint8_t *pt_uid);
+bool    RC522_IsIrqPinOk(void);
+void    RC522_ExtiCallback(void);
 
 #endif /* RC522_H */

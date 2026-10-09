@@ -42,10 +42,13 @@ static volatile uint32_t u4g_ms = 0U;      /* milliseconds since Timebase_Init *
  *
  * @return            - none
  *
- * @Note              - SysTick is a core exception, no NVIC enable needed
+ * @Note              - SysTick is a core exception, no NVIC enable needed.
+ *                      DBG_SLEEP keeps the debugger (SWD) working while
+ *                      the CPU sleeps in Timebase_Sleep.
  *********************************************************************/
 void Timebase_Init(void)
 {
+    DBGMCU->CR |= DBGMCU_CR_DBG_SLEEP;
     SysTick->LOAD = SYSTICK_LOAD_1MS;
     SysTick->VAL  = 0U;
     SysTick->CTRL = (SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk |
@@ -66,8 +69,25 @@ uint32_t Timebase_GetMs(void)
 }
 
 /*********************************************************************
+ * @fn                - Timebase_Sleep
+ * @brief             - Sleep (WFI) until the next interrupt wakes the CPU
+ *
+ * @param[in]         - none
+ *
+ * @return            - none
+ *
+ * @Note              - SysTick wakes the CPU at least every 1 ms; UART,
+ *                      EXTI and timer interrupts wake it earlier
+ *********************************************************************/
+void Timebase_Sleep(void)
+{
+    __WFI();
+}
+
+/*********************************************************************
  * @fn                - Timebase_DelayMs
- * @brief             - Blocking delay
+ * @brief             - Delay driven by the SysTick interrupt: the CPU
+ *                      sleeps between ticks instead of busy-waiting
  *
  * @param[in]         - u4t_ms : delay time in milliseconds
  *
@@ -78,7 +98,7 @@ void Timebase_DelayMs(uint32_t u4t_ms)
     uint32_t u4t_start = u4g_ms;
 
     while ((u4g_ms - u4t_start) < u4t_ms) {
-        /* wait */
+        Timebase_Sleep();
     }
 }
 

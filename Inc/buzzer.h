@@ -1,7 +1,7 @@
 /*******************************************************************************
  * File Name    : buzzer.h
- * Description  : Header file for buzzer.c
- * Date         : 2026-10-08
+ * Description  : Header file for buzzer.c (TIM2 update interrupt, non-blocking)
+ * Date         : 2026-10-09
  ******************************************************************************/
 #ifndef BUZZER_H
 #define BUZZER_H
@@ -30,5 +30,6 @@
 /* Exported function prototypes ----------------------------------------------*/
 void Buzzer_Init(void);
 void Buzzer_Beep(uint32_t u4t_cycles);
+void TIM2_IRQHandler(void);
 
 #endif /* BUZZER_H */

@@ -1,7 +1,10 @@
 /*******************************************************************************
  * File Name    : uart.c
- * Description  : USART2 driver (PA2 TX / PA3 RX, 115200 8N1), polling mode
- * Date         : 2026-10-08
+ * Description  : USART2 driver (PA2 TX / PA3 RX, 115200 8N1), interrupt driven.
+ *                TX : bytes go into a ring buffer, the TXE interrupt sends them.
+ *                RX : the RXNE interrupt stores received bytes in a ring buffer.
+ *                The CPU never waits on a UART status flag (no polling).
+ * Date         : 2026-10-09
  ******************************************************************************/
 
 /* Includes ------------------------------------------------------------------*/
@@ -20,6 +23,10 @@
 /* Private define ------------------------------------------------------------*/
 #define UART_BRR_115200         (139U)   /* 16 MHz / 115200 = 138.9 */
 #define UART_DATA_MASK          (0xFFU)
+#define UART_TX_BUF_SIZE        (1024U)  /* must be a power of 2 */
+#define UART_TX_BUF_MASK        (UART_TX_BUF_SIZE - 1U)
+#define UART_RX_BUF_SIZE        (64U)    /* must be a power of 2 */
+#define UART_RX_BUF_MASK        (UART_RX_BUF_SIZE - 1U)
 #define DEC_BASE                (10U)
 #define UINT32_MAX_DIGITS       (10U)
 #define HEX_NIBBLE_BITS         (4U)
@@ -31,6 +38,14 @@
 static const char ctg_hex_digits[] = "0123456789ABCDEF";
 
 /* Private variables ---------------------------------------------------------*/
+/* TX ring buffer : head written by the main program, tail written by the ISR */
+static volatile uint8_t  u1g_tx_buf[UART_TX_BUF_SIZE];
+static volatile uint32_t u4g_tx_head = 0U;
+static volatile uint32_t u4g_tx_tail = 0U;
+/* RX ring buffer : head written by the ISR, tail written by the main program */
+static volatile uint8_t  u1g_rx_buf[UART_RX_BUF_SIZE];
+static volatile uint32_t u4g_rx_head = 0U;
+static volatile uint32_t u4g_rx_tail = 0U;
 
 /* External variables --------------------------------------------------------*/
 
@@ -41,7 +56,8 @@ static const char ctg_hex_digits[] = "0123456789ABCDEF";
 /* Public functions ----------------------------------------------------------*/
 /*********************************************************************
  * @fn                - UART_Init
- * @brief             - Configure PA2/PA3 as AF7 and USART2 as 115200 8N1
+ * @brief             - Configure PA2/PA3 as AF7, USART2 as 115200 8N1 and
+ *                      enable the USART2 interrupt (RXNE now, TXE on demand)
  *
  * @param[in]         - none
  *
@@ -62,28 +78,36 @@ void UART_Init(void)
     USART2->CR1 &= ~USART_CR1_M;           /* 8 data bits */
     USART2->CR2 &= ~USART_CR2_STOP;        /* 1 stop bit  */
     USART2->BRR = UART_BRR_115200;
-    USART2->CR1 |= (USART_CR1_TE | USART_CR1_RE);
+    USART2->CR1 |= (USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE);
+
+    NVIC_EnableIRQ(USART2_IRQn);
 }
 
 /*********************************************************************
  * @fn                - UART_SendChar
- * @brief             - Send one byte (waits until TX register is empty)
+ * @brief             - Queue one byte for sending (sent by the TXE interrupt)
  *
  * @param[in]         - ct_ch : byte to send
  *
  * @return            - none
+ *
+ * @Note              - Only waits (CPU asleep) when the 1 KB TX buffer is full
  *********************************************************************/
 void UART_SendChar(char ct_ch)
 {
-    while ((USART2->SR & USART_SR_TXE) == 0U) {
-        /* wait */
+    uint32_t u4t_next = (u4g_tx_head + 1U) & UART_TX_BUF_MASK;
+
+    while (u4t_next == u4g_tx_tail) {
+        __WFI();                            /* buffer full: sleep until the TXE interrupt sends a byte */
     }
-    USART2->DR = (uint32_t)((uint8_t)ct_ch);
+    u1g_tx_buf[u4g_tx_head] = (uint8_t)ct_ch;
+    u4g_tx_head = u4t_next;
+    USART2->CR1 |= USART_CR1_TXEIE;        /* start / keep the TX interrupt running */
 }
 
 /*********************************************************************
  * @fn                - UART_SendString
- * @brief             - Send a null-terminated string (UTF-8 is sent as bytes)
+ * @brief             - Queue a null-terminated string (UTF-8 is sent as bytes)
  *
  * @param[in]         - pt_str : string to send
  *
@@ -101,7 +125,7 @@ void UART_SendString(const char *pt_str)
 
 /*********************************************************************
  * @fn                - UART_SendUint
- * @brief             - Send an unsigned number in decimal
+ * @brief             - Queue an unsigned number in decimal
  *
  * @param[in]         - u4t_value : number to send
  *
@@ -127,7 +151,7 @@ void UART_SendUint(uint32_t u4t_value)
 
 /*********************************************************************
  * @fn                - UART_SendHex8
- * @brief             - Send one byte as 2 hex digits
+ * @brief             - Queue one byte as 2 hex digits
  *
  * @param[in]         - u1t_value : byte to send
  *
@@ -141,28 +165,29 @@ void UART_SendHex8(uint8_t u1t_value)
 
 /*********************************************************************
  * @fn                - UART_ReadChar
- * @brief             - Read one received byte if available (non-blocking)
+ * @brief             - Take one received byte from the RX buffer (non-blocking)
  *
  * @param[out]        - pt_ch : received byte
  *
- * @return            - true = a byte was received, false = nothing received
+ * @return            - true = a byte was available, false = buffer empty
  *********************************************************************/
 bool UART_ReadChar(char *pt_ch)
 {
     bool bt_received = false;
 
-    if ((USART2->SR & USART_SR_RXNE) != 0U) {
-        *pt_ch = (char)(USART2->DR & UART_DATA_MASK);
+    if (u4g_rx_tail != u4g_rx_head) {
+        *pt_ch = (char)u1g_rx_buf[u4g_rx_tail];
+        u4g_rx_tail = (u4g_rx_tail + 1U) & UART_RX_BUF_MASK;
         bt_received = true;
     } else {
-        /* No action */
+        /* nothing received */
     }
     return bt_received;
 }
 
 /*********************************************************************
  * @fn                - UART_FlushRx
- * @brief             - Drop any byte that is waiting in the receiver
+ * @brief             - Drop every byte waiting in the RX buffer
  *
  * @param[in]         - none
  *
@@ -170,12 +195,50 @@ bool UART_ReadChar(char *pt_ch)
  *********************************************************************/
 void UART_FlushRx(void)
 {
-    char ct_dummy = '\0';
-
-    while (UART_ReadChar(&ct_dummy) == true) {
-        /* discard */
-    }
+    u4g_rx_tail = u4g_rx_head;
 }
 
 /* Callback functions --------------------------------------------------------*/
+/*********************************************************************
+ * @fn                - USART2_IRQHandler
+ * @brief             - USART2 interrupt: store a received byte (RXNE) and
+ *                      send the next queued byte (TXE)
+ *
+ * @param[in]         - none
+ *
+ * @return            - none
+ *
+ * @Note              - TXE interrupt is switched off when the TX buffer is empty
+ *********************************************************************/
+void USART2_IRQHandler(void)
+{
+    uint32_t u4t_status = USART2->SR;
+    uint32_t u4t_next;
+    uint8_t  u1t_data;
+
+    if ((u4t_status & USART_SR_RXNE) != 0U) {
+        u1t_data = (uint8_t)(USART2->DR & UART_DATA_MASK);   /* also clears RXNE / ORE */
+        u4t_next = (u4g_rx_head + 1U) & UART_RX_BUF_MASK;
+        if (u4t_next != u4g_rx_tail) {
+            u1g_rx_buf[u4g_rx_head] = u1t_data;
+            u4g_rx_head = u4t_next;
+        } else {
+            /* RX buffer full: byte dropped */
+        }
+    } else {
+        /* No action */
+    }
+
+    if (((USART2->CR1 & USART_CR1_TXEIE) != 0U) && ((u4t_status & USART_SR_TXE) != 0U)) {
+        if (u4g_tx_tail != u4g_tx_head) {
+            USART2->DR = (uint32_t)u1g_tx_buf[u4g_tx_tail];
+            u4g_tx_tail = (u4g_tx_tail + 1U) & UART_TX_BUF_MASK;
+        } else {
+            USART2->CR1 &= ~USART_CR1_TXEIE;   /* nothing left to send */
+        }
+    } else {
+        /* No action */
+    }
+}
+
 /* Private functions ---------------------------------------------------------*/

@@ -1,7 +1,7 @@
 /*******************************************************************************
  * File Name    : adc.h
- * Description  : Header file for adc.c (ADC1 single conversion, polling)
- * Date         : 2026-10-08
+ * Description  : Header file for adc.c (ADC1 continuous scan + DMA2 Stream0)
+ * Date         : 2026-10-09
  ******************************************************************************/
 #ifndef ADC_H
 #define ADC_H
